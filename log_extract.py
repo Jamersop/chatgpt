@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Extract relevant information from a log file.
 
-The script scans each log line, tries to detect common fields,
-and prints a concise JSON summary.
+This module provides reusable helpers for both CLI and Streamlit usage.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-
+from typing import Iterable
 
 TIMESTAMP_PATTERNS = [
     re.compile(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:,\d{3}|\.\d+)?\b"),
@@ -24,6 +23,9 @@ IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 USER_PATTERN = re.compile(r"\buser(?:name)?[=:]\s*([\w.@-]+)\b", re.IGNORECASE)
 ERROR_CODE_PATTERN = re.compile(r"\b(?:error[_ -]?code|code)[=:]\s*([A-Z]?\d{2,6})\b", re.IGNORECASE)
 
+CRITICAL_TERMS = ("critical", "fatal", "panic", "outage", "data loss")
+MAJOR_TERMS = ("error", "exception", "failed", "timeout")
+
 
 def first_match(patterns: list[re.Pattern[str]], text: str) -> str | None:
     for pattern in patterns:
@@ -33,7 +35,7 @@ def first_match(patterns: list[re.Pattern[str]], text: str) -> str | None:
     return None
 
 
-def extract(log_path: Path, sample_limit: int) -> dict:
+def summarize_lines(lines: Iterable[str], source_name: str, sample_limit: int = 5) -> dict:
     levels = Counter()
     ips = Counter()
     users = Counter()
@@ -43,47 +45,57 @@ def extract(log_path: Path, sample_limit: int) -> dict:
     total_lines = 0
     lines_with_errors = 0
     interesting_samples: dict[str, list[str]] = defaultdict(list)
+    highlighted_events: dict[str, list[str]] = defaultdict(list)
 
-    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            total_lines += 1
-            line = line.rstrip("\n")
+    for raw_line in lines:
+        total_lines += 1
+        line = raw_line.rstrip("\n")
+        normalized = line.lower()
 
-            timestamp = first_match(TIMESTAMP_PATTERNS, line)
-            if timestamp:
-                timestamps.append(timestamp)
+        timestamp = first_match(TIMESTAMP_PATTERNS, line)
+        if timestamp:
+            timestamps.append(timestamp)
 
-            level_match = LEVEL_PATTERN.search(line)
-            if level_match:
-                level = level_match.group(1).upper()
-                if level == "WARNING":
-                    level = "WARN"
-                levels[level] += 1
+        level_match = LEVEL_PATTERN.search(line)
+        normalized_level = None
+        if level_match:
+            normalized_level = level_match.group(1).upper()
+            if normalized_level == "WARNING":
+                normalized_level = "WARN"
+            levels[normalized_level] += 1
 
-            for ip in IP_PATTERN.findall(line):
-                ips[ip] += 1
+        for ip in IP_PATTERN.findall(line):
+            ips[ip] += 1
 
-            user_match = USER_PATTERN.search(line)
-            if user_match:
-                users[user_match.group(1)] += 1
+        user_match = USER_PATTERN.search(line)
+        if user_match:
+            users[user_match.group(1)] += 1
 
-            code_match = ERROR_CODE_PATTERN.search(line)
-            if code_match:
-                error_codes[code_match.group(1)] += 1
+        code_match = ERROR_CODE_PATTERN.search(line)
+        if code_match:
+            error_codes[code_match.group(1)] += 1
 
-            if "ERROR" in line.upper() or "EXCEPTION" in line.upper():
-                lines_with_errors += 1
-                if len(interesting_samples["errors"]) < sample_limit:
-                    interesting_samples["errors"].append(line)
+        if "error" in normalized or "exception" in normalized:
+            lines_with_errors += 1
+            if len(interesting_samples["errors"]) < sample_limit:
+                interesting_samples["errors"].append(line)
 
-            if "timeout" in line.lower() and len(interesting_samples["timeouts"]) < sample_limit:
-                interesting_samples["timeouts"].append(line)
+        if "timeout" in normalized and len(interesting_samples["timeouts"]) < sample_limit:
+            interesting_samples["timeouts"].append(line)
 
-            if "failed" in line.lower() and len(interesting_samples["failures"]) < sample_limit:
-                interesting_samples["failures"].append(line)
+        if "failed" in normalized and len(interesting_samples["failures"]) < sample_limit:
+            interesting_samples["failures"].append(line)
 
-    summary = {
-        "file": str(log_path),
+        is_critical = any(term in normalized for term in CRITICAL_TERMS) or normalized_level in {"CRITICAL", "FATAL"}
+        is_major = any(term in normalized for term in MAJOR_TERMS) or normalized_level in {"ERROR", "WARN"}
+
+        if is_critical and len(highlighted_events["critical"]) < sample_limit:
+            highlighted_events["critical"].append(line)
+        elif is_major and len(highlighted_events["major"]) < sample_limit:
+            highlighted_events["major"].append(line)
+
+    return {
+        "file": source_name,
         "total_lines": total_lines,
         "lines_with_error_or_exception": lines_with_errors,
         "time_range": {
@@ -95,8 +107,18 @@ def extract(log_path: Path, sample_limit: int) -> dict:
         "top_users": users.most_common(10),
         "error_codes": error_codes.most_common(10),
         "samples": dict(interesting_samples),
+        "highlighted_events": {
+            "critical_count": len(highlighted_events["critical"]),
+            "major_count": len(highlighted_events["major"]),
+            "critical": highlighted_events["critical"],
+            "major": highlighted_events["major"],
+        },
     }
-    return summary
+
+
+def extract(log_path: Path, sample_limit: int) -> dict:
+    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+        return summarize_lines(fh, source_name=str(log_path), sample_limit=sample_limit)
 
 
 def main() -> None:
